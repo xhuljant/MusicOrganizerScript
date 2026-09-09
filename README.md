@@ -51,6 +51,11 @@ This script is built to be cautious with your files:
   nothing is deleted.
 - **Extension repair** — sniffs file magic bytes and renames mislabeled files
   (e.g. a `.mp3` that's really a `.flac`).
+- **Optional lossless → AAC compression** — with `--compress-lossless` (or
+  `COMPRESS_LOSSLESS=1`), lossless tracks (FLAC / WAV / AIFF / ALAC) are
+  transcoded to a `320k` AAC `.m4a` as they enter the library and the original
+  lossless file is moved to trash. Needs `ffmpeg`; still deletes nothing. Lossy
+  sources (MP3, AAC, Opus…) are never re-encoded.
 - **Corruption check** — if `ffmpeg` is on `PATH`, files are fully decoded to catch
   truncated/garbled audio a header-only check would miss.
 - **Compilation detection** — albums with many distinct artists are filed under
@@ -71,7 +76,8 @@ This script is built to be cautious with your files:
 - [`mutagen`](https://pypi.org/project/mutagen/) — audio tag reading/writing
 - [`python-dotenv`](https://pypi.org/project/python-dotenv/) — `.env` loading
 - **`ffmpeg`** (optional but recommended) — enables full-decode corruption checks.
-  Without it, the script falls back to a header-only test.
+  Without it, the script falls back to a header-only test. **Required** if you use
+  `--compress-lossless` (the run aborts at the environment check without it).
 
 ```bash
 pip install mutagen python-dotenv
@@ -109,6 +115,8 @@ REVIEW_FOLDER=/path/to/review          # ambiguous albums land here
 LOG_DIR=/path/to/logs                  # defaults to the script's directory
 TRASH_RETAIN_DAYS=90                   # auto-purge trash older than this (0 = keep forever)
 MIN_FREE_GB=1                          # refuse to run below this much free space
+COMPRESS_LOSSLESS=0                    # 1/true to transcode lossless tracks to AAC on import
+AAC_BITRATE=320k                      # AAC bitrate used when compression is on
 ```
 
 | Variable | Required | Default | Description |
@@ -120,6 +128,8 @@ MIN_FREE_GB=1                          # refuse to run below this much free spac
 | `LOG_DIR` | No | script directory | Where `music_organizer.log` is written. |
 | `TRASH_RETAIN_DAYS` | No | `90` | Days before trashed batches are auto-purged (`0` = forever). |
 | `MIN_FREE_GB` | No | `1` | Minimum free space on the library drive to allow a run. |
+| `COMPRESS_LOSSLESS` | No | `0` | `1`/`true` to transcode lossless tracks to AAC on import (requires `ffmpeg`). |
+| `AAC_BITRATE` | No | `320k` | AAC bitrate used when compression is enabled. |
 
 Unparsable files are quarantined in a `_unparsable` subfolder of staging by
 default (override with `--unparsable`).
@@ -152,6 +162,8 @@ python MusicOrganizerScript.py --restore-trash 20260712_143012
 | `--dry-run` | Show every decision without moving, tagging, or trashing anything. |
 | `--no-upgrade` | Never replace an album already in the library. |
 | `--no-merge` | Disable track-level merging; fall back to whole-album quality comparison. |
+| `--compress-lossless` / `--no-compress-lossless` | Transcode lossless tracks to AAC `.m4a` on import (original → trash), or force it off. Overrides `COMPRESS_LOSSLESS`. Requires `ffmpeg`. |
+| `--aac-bitrate RATE` | AAC bitrate for `--compress-lossless` (default `320k`). |
 | `--quiet` | Log everything to file, but only warnings to the console. |
 | `--trash-retain-days N` | Auto-purge trash older than N days (`0` = forever). |
 | `--list-trash` | Show what's been discarded. |
@@ -184,7 +196,15 @@ what's already in the library:
 Quality comparison order: **lossless ratio → resolution (bit depth × sample rate)
 → average bitrate → track count**. A contender must beat the other by 10% on
 bitrate/resolution or 20% on track count to win, so near-ties fall through to
-review rather than churning your library.
+review rather than churning your library. All of this is judged on the **original
+staged files**.
+
+When `--compress-lossless` is on, transcoding happens **last** — after every
+placement decision above — so a lossless album is never made to look lossy while
+it's being compared. At the moment each lossless track would move into the
+library it is instead encoded to a `320k` AAC `.m4a` (embedded art and tags
+carried over), the result is decode-verified, and the original lossless file is
+moved to trash. If an encode fails, that track is left untouched in staging.
 
 ---
 

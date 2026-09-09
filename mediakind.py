@@ -189,7 +189,14 @@ def _probe(path: Path) -> Dict[str, object]:
         info["comment"] = " ".join(comment_bits)
         if not info["genre"]:
             for key in ("tcon", "\xa9gen", "©gen", "genre"):
-                if key in raw:
+                # A VComment (FLAC/Ogg) raises ValueError - not KeyError - for a
+                # key with illegal characters, and DictMixin.__contains__ only
+                # swallows KeyError, so the `in` test itself can throw.
+                try:
+                    present = key in raw
+                except (ValueError, KeyError):
+                    present = False
+                if present:
                     info["genre"] = _norm(_stringify(raw[key]))
                     break
     return info

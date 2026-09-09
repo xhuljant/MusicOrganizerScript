@@ -13,10 +13,15 @@ Rewritten to be safe by default:
   * Zip extraction is path-validated (no Zip Slip) and skips archives containing books.
   * Files that can't be parsed as audio are quarantined in the staging folder,
     never moved into the library.
+  * Optional: with --compress-lossless (or COMPRESS_LOSSLESS in .env), lossless
+    tracks (FLAC/WAV/AIFF/ALAC) are transcoded to an AAC .m4a as they enter the
+    library and the original lossless file is routed to trash — needs ffmpeg,
+    still deletes nothing.
 
 Usage:
     python music_manager.py --dry-run          # see what it would do
     python music_manager.py                    # do it
+    python music_manager.py --compress-lossless   # ...and shrink lossless to AAC
     python music_manager.py --list-trash       # what got discarded, and when it expires
     python music_manager.py --restore-trash 20260712_143012
 """
@@ -38,6 +43,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import mutagen
+import mutagen.id3
 from dotenv import load_dotenv
 
 os.environ.setdefault("SCRIPT_DIR", os.path.dirname(os.path.abspath(__file__)))
@@ -260,6 +266,15 @@ MAX_LOG_BYTES = 5 * 1024 * 1024
 # old header-only behaviour.
 FFMPEG = shutil.which("ffmpeg")
 FFMPEG_TIMEOUT = 30             # Per-file decode timeout, seconds
+FFMPEG_ENCODE_TIMEOUT = 600    # Per-file transcode timeout, seconds
+
+# Optional lossless -> AAC compression on import. Off unless COMPRESS_LOSSLESS is
+# set (or --compress-lossless is passed). When on, lossless staged tracks
+# (FLAC/WAV/AIFF/ALAC) are transcoded to an .m4a AAC copy as they enter the
+# library and the original is routed to trash - nothing is deleted outright.
+# Requires ffmpeg.
+COMPRESS_LOSSLESS = os.getenv("COMPRESS_LOSSLESS", "").strip().lower() in ("1", "true", "yes", "on")
+AAC_BITRATE = os.getenv("AAC_BITRATE", "320k").strip() or "320k"
 
 WINDOWS_RESERVED = {
     "CON", "PRN", "AUX", "NUL",
@@ -539,6 +554,15 @@ def _read_quality_uncached(path: Path) -> Optional[Quality]:
         return None
 
 
+def _audio_length(path: Path) -> float:
+    """Playback duration in seconds via mutagen's header, or 0.0 if unknown."""
+    try:
+        audio = mutagen.File(long_path(path))
+        return float(getattr(getattr(audio, "info", None), "length", 0) or 0)
+    except Exception:
+        return 0.0
+
+
 def plays_ok(path: Path) -> Optional[bool]:
     """Prove the audio actually decodes, not just that the header parses."""
     if FFMPEG is None:
@@ -683,7 +707,21 @@ def parse_from_filename(path: Path, staging: Path) -> Dict[str, Optional[str]]:
         stem = m.group(2)
 
     parts = [p.strip() for p in stem.split(" - ") if p.strip()]
-    if len(parts) >= 3:
+
+    def _is_track(s: str) -> bool:
+        return bool(re.fullmatch(r"\d{1,3}", s))
+
+    if len(parts) >= 4 and not meta["track"] and _is_track(parts[2]):
+        # "Artist - Album - NN - Title" (track number in the middle)
+        meta["artist"], meta["album"] = parts[0], parts[1]
+        meta["track"] = parts[2].lstrip("0") or "0"
+        meta["title"] = " - ".join(parts[3:])
+    elif len(parts) == 3 and not meta["track"] and _is_track(parts[1]):
+        # "Artist - NN - Title"
+        meta["artist"] = parts[0]
+        meta["track"] = parts[1].lstrip("0") or "0"
+        meta["title"] = parts[2]
+    elif len(parts) >= 3:
         meta["artist"], meta["album"], meta["title"] = parts[0], parts[1], parts[2]
     elif len(parts) == 2:
         meta["artist"], meta["title"] = parts[0], parts[1]
@@ -749,6 +787,28 @@ def read_tags(path: Path, staging: Path) -> Dict[str, Optional[str]]:
     return tags
 
 
+# write_tags key -> ID3 frame, for containers whose tag store is a raw ID3 chunk
+# (WAV/AIFF) and so can't take mutagen's easy string API.
+_ID3_FRAMES = {"artist": "TPE1", "albumartist": "TPE2",
+               "album": "TALB", "title": "TIT2", "track": "TRCK"}
+
+
+def _write_tags_id3(audio, tags: Dict[str, Optional[str]]) -> bool:
+    if audio.tags is None:
+        audio.add_tags()
+    changed = False
+    for key, frame_id in _ID3_FRAMES.items():
+        value = tags.get(key)
+        if not value or audio.tags.getall(frame_id):
+            continue
+        audio.tags.add(getattr(mutagen.id3, frame_id)(encoding=3, text=[str(value)]))
+        changed = True
+    if changed:
+        audio.save()
+        stats["metadata_written"] += 1
+    return changed
+
+
 def write_tags(path: Path, tags: Dict[str, Optional[str]], dry_run: bool) -> bool:
     if dry_run:
         return False
@@ -756,6 +816,14 @@ def write_tags(path: Path, tags: Dict[str, Optional[str]], dry_run: bool) -> boo
         audio = mutagen.File(long_path(path), easy=True)
         if audio is None:
             return False
+
+        # mutagen has no easy=True wrapper for WAV/AIFF, so `audio` is the raw
+        # container and its tag store is (or would be) an ID3 chunk that rejects
+        # plain strings ("'x' not a Frame instance"). Write real frames instead.
+        if isinstance(audio.tags, mutagen.id3.ID3) or path.suffix.lower() in (
+                ".wav", ".wave", ".aif", ".aiff", ".aifc"):
+            return _write_tags_id3(audio, tags)
+
         if audio.tags is None:
             audio.add_tags()
 
@@ -869,6 +937,100 @@ def move_verified(src: Path, dst: Path, dry_run: bool) -> bool:
         part.unlink(missing_ok=True)
         stats["errors"] += 1
         return False
+
+
+def encode_to_aac(src: Path, dst: Path, bitrate: str) -> bool:
+    """Transcode one lossless file to an AAC .m4a at dst. Writes to a temp
+    sibling then atomically replaces, mirroring move_verified. The source is
+    left untouched — the caller decides what happens to it."""
+    if FFMPEG is None:
+        log.error(f"    x Cannot transcode {src.name}: ffmpeg not on PATH")
+        stats["errors"] += 1
+        return False
+    part = dst.with_suffix(dst.suffix + ".part")
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        part.unlink(missing_ok=True)
+        # The temp file ends in ".part", so ffmpeg can't guess the container from
+        # the name — force the iTunes/m4a muxer with -f ipod. Plain str() paths
+        # (not the \\?\ long-path form) are what ffmpeg understands on Windows,
+        # matching plays_ok().
+        cmd = [
+            FFMPEG, "-v", "error", "-y", "-i", str(src),
+            "-map", "0:a", "-map", "0:v?", "-c:v", "copy",
+            "-c:a", "aac", "-b:a", bitrate,
+            "-map_metadata", "0", "-movflags", "+faststart",
+            "-f", "ipod", str(part),
+        ]
+        proc = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.PIPE, timeout=FFMPEG_ENCODE_TIMEOUT)
+        if proc.returncode != 0 or not part.exists():
+            detail = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+            log.error(f"    x ffmpeg failed to transcode {src.name}"
+                      + (f": {detail[-1]}" if detail else ""))
+            part.unlink(missing_ok=True)
+            stats["errors"] += 1
+            return False
+
+        if part.stat().st_size == 0:
+            log.error(f"    x Transcode of {src.name} produced an empty file, discarding it")
+            part.unlink(missing_ok=True)
+            stats["errors"] += 1
+            return False
+
+        # The encode must cover the whole source, and the result must decode.
+        src_len, out_len = _audio_length(src), _audio_length(part)
+        if src_len and out_len and abs(src_len - out_len) > max(1.0, src_len * 0.02):
+            log.error(f"    x Transcode of {src.name} is {out_len:.0f}s vs the "
+                      f"source's {src_len:.0f}s — discarding it")
+            part.unlink(missing_ok=True)
+            stats["errors"] += 1
+            return False
+        if plays_ok(part) is False:
+            log.error(f"    x Transcoded {dst.name} does not decode cleanly, discarding it")
+            part.unlink(missing_ok=True)
+            stats["errors"] += 1
+            return False
+
+        os.replace(long_path(part), long_path(dst))
+        return True
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.error(f"    x Failed to transcode {src.name}: {e}")
+        part.unlink(missing_ok=True)
+        stats["errors"] += 1
+        return False
+
+
+def deliver_track(path: Path, target_dir: Path, target_name: str, trash: "Trash",
+                  dry_run: bool, compress: bool, bitrate: str) -> bool:
+    """Put one staged track into target_dir. With compression on and a lossless
+    source, transcode to an AAC .m4a and route the original to trash; otherwise
+    hash-verified move (unchanged behaviour for lossy tracks)."""
+    q = read_quality(path) if compress else None
+    if not (compress and q and q.lossless):
+        return move_verified(path, target_dir / target_name, dry_run)
+
+    aac_name = sanitize_name(Path(target_name).stem + ".m4a", limit=150)
+    target = target_dir / aac_name
+    n = 1
+    while target.exists():
+        target = target_dir / sanitize_name(f"{Path(target_name).stem}_{n}.m4a", limit=150)
+        n += 1
+
+    log.info(f"    -> transcode to AAC {bitrate}: {target_dir.name}/{target.name}")
+    if dry_run:
+        return True
+
+    if not encode_to_aac(path, target, bitrate):
+        log.error(f"    x Kept lossless {path.name} in staging (transcode failed)")
+        return False
+
+    saved = path.stat().st_size - target.stat().st_size
+    stats["files_transcoded"] += 1
+    if saved > 0:
+        stats["bytes_saved"] += saved
+    trash.discard(path, f"replaced by AAC {bitrate} copy", origin=path.parent)
+    return True
 
 
 def quarantine_unparsable(path: Path, unparsable_dir: Path, dry_run: bool) -> None:
@@ -1057,7 +1219,8 @@ def normalize_title(name: Optional[str]) -> str:
 
 
 def merge_album(alb: Album, existing: Path, old_files: List[Path], library: Path,
-                trash: Trash, dry_run: bool) -> None:
+                trash: Trash, dry_run: bool, compress: bool = False,
+                bitrate: str = AAC_BITRATE) -> None:
     have = {normalize_title(read_tags(f, library).get("title")) for f in old_files}
     have.discard("")
 
@@ -1078,7 +1241,7 @@ def merge_album(alb: Album, existing: Path, old_files: List[Path], library: Path
             target = existing / sanitize_name(f"{path.stem}_{n}{path.suffix}", limit=150)
             n += 1
         log.info(f"    + {tags.get('title') or path.name} -> {existing.name}/{target.name}")
-        if move_verified(path, target, dry_run):
+        if deliver_track(path, existing, target.name, trash, dry_run, compress, bitrate):
             imported += 1
             stats["files_moved"] += 1
             stats["tracks_imported"] += 1
@@ -1099,7 +1262,8 @@ def merge_album(alb: Album, existing: Path, old_files: List[Path], library: Path
 
 
 def process_album(alb: Album, library: Path, review: Path, trash: Trash,
-                  dry_run: bool, upgrade: bool, merge: bool = True) -> None:
+                  dry_run: bool, upgrade: bool, merge: bool = True,
+                  compress: bool = False, bitrate: str = AAC_BITRATE) -> None:
     log.info(f"\n--- {alb.key} ---")
     new_q = AlbumQuality(alb.files)
     log.info(f"  Staged:  {new_q}")
@@ -1120,7 +1284,8 @@ def process_album(alb: Album, library: Path, review: Path, trash: Trash,
             return
 
         if merge:
-            merge_album(alb, existing, old_files, library, trash, dry_run)
+            merge_album(alb, existing, old_files, library, trash, dry_run,
+                        compress, bitrate)
             return
 
         verdict, why = compare_albums(new_q, old_q)
@@ -1154,7 +1319,13 @@ def process_album(alb: Album, library: Path, review: Path, trash: Trash,
     dest = library / alb.artist / alb.album
     for path, tags in alb.tracks:
         write_tags(path, tags, dry_run)
-        target = dest / sanitize_name(path.name, limit=150)
+        src_name = sanitize_name(path.name, limit=150)
+        q_src = read_quality(path)
+        will_transcode = bool(compress and q_src and q_src.lossless)
+        # When we're about to transcode, the file that would actually land in the
+        # library — and clash with an existing copy — is the .m4a, not the source.
+        target = dest / (sanitize_name(Path(src_name).stem + ".m4a", limit=150)
+                         if will_transcode else src_name)
 
         if target.exists():
             if file_hash(path) == file_hash(target):
@@ -1170,8 +1341,9 @@ def process_album(alb: Album, library: Path, review: Path, trash: Trash,
                 stats["duplicates"] += 1
                 continue
 
-        log.info(f"    -> {alb.artist}/{alb.album}/{target.name}")
-        if move_verified(path, target, dry_run):
+        if not will_transcode:
+            log.info(f"    -> {alb.artist}/{alb.album}/{target.name}")
+        if deliver_track(path, dest, src_name, trash, dry_run, compress, bitrate):
             stats["files_moved"] += 1
 
     for c in alb.companions:
@@ -1188,7 +1360,8 @@ def process_album(alb: Album, library: Path, review: Path, trash: Trash,
 # ============================================================================
 # ENVIRONMENT & CLEANUP
 # ============================================================================
-def verify_environment(staging: Path, library: Path, trash_root: Path) -> bool:
+def verify_environment(staging: Path, library: Path, trash_root: Path,
+                       compress: bool = False, bitrate: str = AAC_BITRATE) -> bool:
     issues = []
 
     if not staging.is_dir():
@@ -1226,6 +1399,12 @@ def verify_environment(staging: Path, library: Path, trash_root: Path) -> bool:
                     "header-only test. Install ffmpeg for a full decode check.")
     else:
         log.info(f"ffmpeg: {FFMPEG}")
+
+    if compress:
+        if FFMPEG is None:
+            issues.append("--compress-lossless / COMPRESS_LOSSLESS needs ffmpeg on PATH")
+        else:
+            log.info(f"Lossless compression: ON — transcoding to AAC {bitrate} on import")
 
     for issue in issues:
         log.error(f"FATAL: {issue}")
@@ -1269,6 +1448,13 @@ def main():
                    help="Never replace an album already in the library")
     p.add_argument("--no-merge", action="store_false", dest="merge",
                    help="Disable track-level merging into existing library albums")
+    p.add_argument("--compress-lossless", action=argparse.BooleanOptionalAction,
+                   default=COMPRESS_LOSSLESS,
+                   help="Transcode lossless tracks (FLAC/WAV/AIFF/ALAC) to AAC on "
+                        "import; the original is routed to trash. Needs ffmpeg. "
+                        f"(default: {'on' if COMPRESS_LOSSLESS else 'off'})")
+    p.add_argument("--aac-bitrate", default=AAC_BITRATE,
+                   help=f"AAC bitrate for --compress-lossless (default: {AAC_BITRATE})")
     p.add_argument("--quiet", action="store_true", help="Only warnings and the summary are logged/shown")
     p.add_argument("--trash-retain-days", type=int, default=TRASH_RETAIN_DAYS,
                    help=f"Auto-purge trash older than N days (default: {TRASH_RETAIN_DAYS}, 0 = forever)")
@@ -1308,7 +1494,8 @@ def main():
     log.info(f"  Library: {library}")
     log.info("=" * 60)
 
-    if not verify_environment(staging, library, trash_root):
+    if not verify_environment(staging, library, trash_root,
+                              args.compress_lossless, args.aac_bitrate):
         sys.exit(1)
 
     try:
@@ -1324,7 +1511,8 @@ def main():
             log.info(f"\n{len(albums)} album(s) to process")
             for alb in sorted(albums, key=lambda a: a.key):
                 process_album(alb, library, review, trash, args.dry_run,
-                              not args.no_upgrade, args.merge)
+                              not args.no_upgrade, args.merge,
+                              args.compress_lossless, args.aac_bitrate)
 
         cleanup_empty_dirs(staging, exclude=exclude_dirs, dry_run=args.dry_run)
 
@@ -1337,6 +1525,8 @@ def main():
     log.info("RUN COMPLETE" + (" (DRY RUN — nothing changed)" if args.dry_run else ""), extra=summary)
     log.info("=" * 60, extra=summary)
     log.info(f"  Tracks moved:        {stats['files_moved']}", extra=summary)
+    log.info(f"  Tracks transcoded:   {stats['files_transcoded']}", extra=summary)
+    log.info(f"  Space saved (AAC):   {human_size(stats['bytes_saved'])}", extra=summary)
     log.info(f"  Artwork/extras:      {stats['companions_moved']}", extra=summary)
     log.info(f"  Tags written:        {stats['metadata_written']}", extra=summary)
     log.info(f"  Extensions fixed:    {stats['extensions_fixed']}", extra=summary)
@@ -1365,6 +1555,10 @@ def main():
     if stats["unparsable"]:
         log.info(f"\n{stats['unparsable']} unparsable file(s) moved to {unparsable_dir} "
                  f"— nothing was deleted.")
+    if stats["files_transcoded"]:
+        log.info(f"\n{stats['files_transcoded']} lossless track(s) transcoded to AAC "
+                 f"{args.aac_bitrate}, saving {human_size(stats['bytes_saved'])}. The "
+                 f"originals were moved to trash — nothing was deleted.")
     if stats["trashed"] and not args.dry_run:
         log.info(f"\n{stats['trashed']} item(s) moved to trash, recoverable for "
                  f"{args.trash_retain_days} days. See them with --list-trash")
