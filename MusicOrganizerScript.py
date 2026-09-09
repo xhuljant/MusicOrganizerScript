@@ -4,8 +4,9 @@ Music Library Manager — stages downloads into a Plex-friendly library.
 
 Rewritten to be safe by default:
   * Nothing is ever deleted. Discards go to a trash folder with 90-day retention.
-  * Ebook and audiobook files are completely IGNORED and left untouched in staging
-    for external scripts/managers to process.
+  * Shares one staging folder with the audiobook organizer. Ebooks, audiobook
+    files, and anything the shared mediakind.py classifier calls an audiobook (or
+    can't confidently place) are left untouched in staging for that script.
   * --dry-run shows every decision before anything moves.
   * Albums are judged ONCE, as a unit, on quality — not per-file, and not on track count.
   * Moves are hash-verified across drives.
@@ -21,6 +22,7 @@ Usage:
 """
 
 import argparse
+import atexit
 import hashlib
 import logging
 import logging.handlers
@@ -29,6 +31,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import zipfile
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -37,21 +40,190 @@ from typing import Dict, List, Optional, Tuple
 import mutagen
 from dotenv import load_dotenv
 
-load_dotenv()  # reads the .env file in the current directory
+os.environ.setdefault("SCRIPT_DIR", os.path.dirname(os.path.abspath(__file__)))
+# Load .env from beside the script (not the cwd) so scheduled runs and the shared
+# organize_downloads wrapper still resolve STAGING_FOLDER etc.
+load_dotenv(os.path.join(os.environ["SCRIPT_DIR"], ".env"))
+
+# Shared music-vs-audiobook classifier (a byte-identical copy lives in the
+# audiobook organizer's folder). Keep both copies in sync - see mediakind.py.
+sys.path.insert(0, os.environ["SCRIPT_DIR"])
+import mediakind
+
+
+def resolve_path(win_path, fallback=None):
+    """Translate a Windows path (authored for the real host machine) into
+    the container's mounted equivalent when this runs inside the
+    script-manager container - only /scripts, /data and any drives
+    bind-mounted at /mnt/<letter> (see the project's .env) exist in there.
+    Returns the path unchanged when running directly on Windows."""
+    if not win_path:
+        return fallback if fallback is not None else win_path
+    if os.name != "posix":
+        return win_path
+    drive, sep, rest = win_path.partition(":")
+    if sep and len(drive) == 1 and drive.isalpha():
+        mounted = os.path.join("/mnt", drive.lower())
+        if os.path.isdir(mounted):
+            return os.path.join(mounted, rest.lstrip("\\/").replace("\\", "/"))
+    return fallback if fallback is not None else win_path
+
+
+class Logger:
+    """Console + file logger for script-manager scripts.
+
+    Each run's block is written to the TOP of the log file, with that run's
+    summary lines first and its detail lines after - so opening the file (or
+    the script-manager web app's log tab, which reads the head of the file)
+    always shows the latest run's outcome first, with no scrolling needed.
+
+    Every line is streamed to stdout immediately (live-visible in the web
+    app while a run is in progress) and appended to a "<name>.log.session"
+    sidecar file as it happens, so a hard kill / power cut doesn't lose the
+    run's detail - it's recovered as plain, unordered text on next startup.
+    """
+
+    def __init__(self, log_file, run_label="Run", max_bytes=5 * 1024 * 1024):
+        self.log_file = Path(log_file)
+        self.session_file = self.log_file.with_suffix(self.log_file.suffix + ".session")
+        self.run_label = run_label
+        self.max_bytes = max_bytes
+        self._fh = None
+        self._lock = threading.Lock()
+        self._detail = []
+        self._summary = []
+        self._start_time = None
+
+    def open(self):
+        self._recover_orphaned_session()
+        self._start_time = datetime.now()
+        self._fh = open(self.session_file, "w", encoding="utf-8")
+        self._stream(f"{self.run_label} started at {self._start_time:%Y-%m-%d %H:%M:%S}")
+
+    def log(self, message: str):
+        self._emit(message, is_summary=False)
+
+    def log_summary(self, message: str):
+        self._emit(message, is_summary=True)
+
+    def _emit(self, message: str, is_summary: bool):
+        with self._lock:
+            (self._summary if is_summary else self._detail).append(message)
+        self._stream(message)
+
+    def _stream(self, message: str):
+        try:
+            print(message)
+        except (BrokenPipeError, OSError):
+            pass  # stdout closed (e.g. piped into head) — keep writing to the file
+        if self._fh:
+            with self._lock:
+                self._fh.write(message + "\n")
+                self._fh.flush()
+
+    def close(self):
+        if not self._fh:
+            return
+        end_time = datetime.now()
+        self._fh.close()
+        self._fh = None
+
+        sep = "=" * 60
+        block_lines = [
+            sep,
+            f"{self.run_label} started at {self._start_time:%Y-%m-%d %H:%M:%S}",
+            f"{self.run_label} ended at   {end_time:%Y-%m-%d %H:%M:%S}",
+            sep,
+        ]
+        if self._summary:
+            block_lines.append("")
+            block_lines.extend(self._summary)
+        if self._detail:
+            block_lines.append("")
+            block_lines.append("--- detail " + "-" * 49)
+            block_lines.extend(self._detail)
+        block_lines.append("")
+        self._merge("\n".join(block_lines) + "\n")
+
+        try:
+            self.session_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _recover_orphaned_session(self):
+        """A leftover session file means the last run was killed. Recover it
+        as plain, unordered detail - we can't know where a summary would
+        have gone."""
+        if not (self.session_file.exists() and self.session_file.stat().st_size > 0):
+            return
+        print("Recovering log from a previous interrupted run...")
+        try:
+            session = self.session_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return
+        if session.strip():
+            sep = "=" * 60
+            self._merge(f"{sep}\n(recovered after an interrupted run)\n{sep}\n{session}\n")
+        try:
+            self.session_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _merge(self, new_block: str):
+        history = ""
+        if self.log_file.exists():
+            try:
+                history = self.log_file.read_text(encoding="utf-8", errors="replace")
+            except OSError as e:
+                print(f"Warning: could not read existing log: {e}")
+
+        if len(history) > self.max_bytes:
+            history = history[:self.max_bytes].rsplit("\n", 1)[0]
+            history += "\n\n[... older entries truncated ...]\n"
+
+        try:
+            with open(self.log_file, "w", encoding="utf-8") as f:
+                f.write(new_block)
+                f.write(history)
+        except OSError as e:
+            print(f"Error writing log file: {e} (session kept at {self.session_file})")
+
+
+class _LoggerHandler(logging.Handler):
+    """Bridges the stdlib logging module to a Logger instance, so existing
+    logging.info()/.warning()/.error() call sites keep working unchanged.
+    A record is treated as a summary line (floated to the top of the log
+    block) only when logged with extra={"summary": True}."""
+
+    def __init__(self, target: "Logger"):
+        super().__init__()
+        self._target = target
+
+    def emit(self, record):
+        message = self.format(record)
+        if getattr(record, "summary", False):
+            self._target.log_summary(message)
+        else:
+            self._target.log(message)
+
 
 # CONFIG
-STAGING_FOLDER = os.getenv("STAGING_FOLDER")    # Download / staging folder
-LIBRARY_FOLDER = os.getenv("LIBRARY_FOLDER")        # Plex music library root
+STAGING_FOLDER = resolve_path(os.getenv("STAGING_FOLDER"))    # Download / staging folder
+LIBRARY_FOLDER = resolve_path(os.getenv("LIBRARY_FOLDER"))        # Plex music library root
 
 # Trash MUST live outside the Plex library root, or Plex will index the discards.
-TRASH_FOLDER = os.getenv("TRASH_FOLDER") 
-REVIEW_FOLDER = os.getenv("REVIEW_FOLDER")     # Ambiguous albums land here for you to judge
+TRASH_FOLDER = resolve_path(os.getenv("TRASH_FOLDER"))
+REVIEW_FOLDER = resolve_path(os.getenv("REVIEW_FOLDER"))     # Ambiguous albums land here for you to judge
 
-# Files that can't be parsed as audio go here — a subfolder of the staging (temp
-# music) folder — instead of being moved into the library. Nothing is deleted.
+# Files that can't be parsed as audio go here instead of being moved into the
+# library. Nothing is deleted. When music shares its staging folder with the
+# audiobook organizer, set UNPARSABLE_DIR to a path OUTSIDE staging so the other
+# script doesn't re-scan quarantined files; otherwise it defaults to an
+# "_unparsable" subfolder of staging.
 UNPARSABLE_DIRNAME = "_unparsable"
+UNPARSABLE_DIR = resolve_path(os.getenv("UNPARSABLE_DIR"))
 
-LOG_DIR = os.getenv("LOG_DIR", os.path.dirname(__file__))
+LOG_DIR = resolve_path(os.getenv("LOG_DIR"), fallback=os.path.dirname(__file__))
 LOG_FILE = os.path.join(LOG_DIR, "music_organizer.log")
 TRASH_RETAIN_DAYS = os.getenv("TRASH_RETAIN_DAYS", 90)             # Auto-purge trashed items older than this (0 = keep forever)
 MIN_FREE_GB = os.getenv("MIN_FREE_GB",1)            # Refuse to run below this much free space on the library drive
@@ -129,21 +301,22 @@ def file_hash(path: Path) -> Optional[str]:
         return None
 
 
+shared_logger: Optional[Logger] = None
+
+
 def setup_logging(log_file: Path, quiet: bool):
+    global shared_logger
     log.setLevel(logging.INFO)
     log.handlers.clear()
-    fmt = logging.Formatter("[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
-    # Rotating, so the log doesn't grow forever.
-    fh = logging.handlers.RotatingFileHandler(
-        log_file, maxBytes=MAX_LOG_BYTES, backupCount=3, encoding="utf-8")
-    fh.setFormatter(fmt)
-    log.addHandler(fh)
+    shared_logger = Logger(log_file, run_label="Music organizer", max_bytes=MAX_LOG_BYTES)
+    shared_logger.open()
+    atexit.register(shared_logger.close)
 
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setFormatter(logging.Formatter("%(message)s"))
-    sh.setLevel(logging.WARNING if quiet else logging.INFO)
-    log.addHandler(sh)
+    handler = _LoggerHandler(shared_logger)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    handler.setLevel(logging.WARNING if quiet else logging.INFO)
+    log.addHandler(handler)
 
 
 def sanitize_name(name: str, limit: int = 100) -> str:
@@ -626,7 +799,9 @@ def safe_extract(zf: zipfile.ZipFile, dest: Path) -> int:
 
 
 def extract_archives(staging: Path, trash: Trash, dry_run: bool) -> int:
-    zips = [z for z in staging.rglob("*.zip") if trash.root not in z.parents]
+    zips = [z for z in staging.rglob("*.zip")
+            if trash.root not in z.parents
+            and not any(part.lower() in mediakind.CONTROL_DIR_NAMES for part in z.parts)]
     if not zips:
         return 0
     log.info(f"=== Checking {len(zips)} archive(s) ===")
@@ -769,6 +944,8 @@ def collect_albums(staging: Path, exclude: List[Path], unparsable_dir: Path,
     for f in staging.rglob("*"):
         if not f.is_file() or any(x in f.parents for x in exclude):
             continue
+        if any(part.lower() in mediakind.CONTROL_DIR_NAMES for part in f.parts):
+            continue  # the audiobook organizer's trash/work folders, if inside staging
         ext = f.suffix.lower()
         if ext in BOOK_EXTENSIONS:
             stats["books_skipped"] += 1
@@ -841,6 +1018,25 @@ def collect_albums(staging: Path, exclude: List[Path], unparsable_dir: Path,
                 t["artist"] = album_artist
             alb.tracks.append((path, t))
         groups[key] = alb
+
+    # Music shares this staging folder with the audiobook organizer. Ask the
+    # shared classifier who owns each album - keep only "music"; leave audiobooks
+    # and anything ambiguous in staging, untouched.
+    music_groups: Dict[tuple, Album] = {}
+    for key, alb in groups.items():
+        verdict, reasons = mediakind.classify(alb.files, staging)
+        if verdict == "audiobook":
+            log.info(f"  Audiobook, not music - left in staging for the audiobook "
+                     f"organizer: {alb.key} [{'; '.join(reasons)}]")
+            stats["books_skipped"] += len(alb.files)
+            continue
+        if verdict == "ambiguous":
+            log.warning(f"  AMBIGUOUS - left in staging for you to sort: {alb.key} "
+                        f"[{'; '.join(reasons)}]")
+            stats["ambiguous"] += len(alb.files)
+            continue
+        music_groups[key] = alb
+    groups = music_groups
 
     for alb in groups.values():
         for folder in {p.parent for p in alb.files}:
@@ -1073,7 +1269,7 @@ def main():
                    help="Never replace an album already in the library")
     p.add_argument("--no-merge", action="store_false", dest="merge",
                    help="Disable track-level merging into existing library albums")
-    p.add_argument("--quiet", action="store_true", help="Log to file, only warnings to console")
+    p.add_argument("--quiet", action="store_true", help="Only warnings and the summary are logged/shown")
     p.add_argument("--trash-retain-days", type=int, default=TRASH_RETAIN_DAYS,
                    help=f"Auto-purge trash older than N days (default: {TRASH_RETAIN_DAYS}, 0 = forever)")
     p.add_argument("--list-trash", action="store_true", help="Show what's been discarded")
@@ -1090,7 +1286,12 @@ def main():
     library = Path(args.library)
     trash_root = Path(args.trash)
     review = Path(args.review)
-    unparsable_dir = Path(args.unparsable) if args.unparsable else staging / UNPARSABLE_DIRNAME
+    if args.unparsable:
+        unparsable_dir = Path(args.unparsable)
+    elif UNPARSABLE_DIR:
+        unparsable_dir = Path(UNPARSABLE_DIR)
+    else:
+        unparsable_dir = staging / UNPARSABLE_DIRNAME
 
     setup_logging(Path(args.log_file), args.quiet)
     trash = Trash(trash_root, args.trash_retain_days, args.dry_run)
@@ -1131,24 +1332,26 @@ def main():
         log.warning("\nInterrupted. Files already moved are safe; the rest are untouched in staging.")
         sys.exit(130)
 
-    log.info("\n" + "=" * 60)
-    log.info("RUN COMPLETE" + (" (DRY RUN — nothing changed)" if args.dry_run else ""))
-    log.info("=" * 60)
-    log.info(f"  Tracks moved:        {stats['files_moved']}")
-    log.info(f"  Artwork/extras:      {stats['companions_moved']}")
-    log.info(f"  Tags written:        {stats['metadata_written']}")
-    log.info(f"  Extensions fixed:    {stats['extensions_fixed']}")
-    log.info(f"  Albums upgraded:     {stats['albums_upgraded']}")
-    log.info(f"  Albums merged:       {stats['albums_merged']}")
-    log.info(f"  Missing tracks added:{stats['tracks_imported']}")
-    log.info(f"  Albums kept as-is:   {stats['albums_kept']}")
-    log.info(f"  Needing review:      {stats['albums_needing_review']}")
-    log.info(f"  Duplicates trashed:  {stats['duplicates']}")
-    log.info(f"  Books skipped:       {stats['books_skipped']}")
-    log.info(f"  Unparsable:          {stats['unparsable']}")
-    log.info(f"  Incomplete skipped:  {stats['skipped_incomplete']}")
-    log.info(f"  Errors:              {stats['errors']}")
-    log.info("=" * 60)
+    summary = {"summary": True}
+    log.info("\n" + "=" * 60, extra=summary)
+    log.info("RUN COMPLETE" + (" (DRY RUN — nothing changed)" if args.dry_run else ""), extra=summary)
+    log.info("=" * 60, extra=summary)
+    log.info(f"  Tracks moved:        {stats['files_moved']}", extra=summary)
+    log.info(f"  Artwork/extras:      {stats['companions_moved']}", extra=summary)
+    log.info(f"  Tags written:        {stats['metadata_written']}", extra=summary)
+    log.info(f"  Extensions fixed:    {stats['extensions_fixed']}", extra=summary)
+    log.info(f"  Albums upgraded:     {stats['albums_upgraded']}", extra=summary)
+    log.info(f"  Albums merged:       {stats['albums_merged']}", extra=summary)
+    log.info(f"  Missing tracks added:{stats['tracks_imported']}", extra=summary)
+    log.info(f"  Albums kept as-is:   {stats['albums_kept']}", extra=summary)
+    log.info(f"  Needing review:      {stats['albums_needing_review']}", extra=summary)
+    log.info(f"  Duplicates trashed:  {stats['duplicates']}", extra=summary)
+    log.info(f"  Audiobooks skipped:  {stats['books_skipped']}", extra=summary)
+    log.info(f"  Ambiguous (left):    {stats['ambiguous']}", extra=summary)
+    log.info(f"  Unparsable:          {stats['unparsable']}", extra=summary)
+    log.info(f"  Incomplete skipped:  {stats['skipped_incomplete']}", extra=summary)
+    log.info(f"  Errors:              {stats['errors']}", extra=summary)
+    log.info("=" * 60, extra=summary)
 
     if stats["books_skipped"]:
         log.info(f"\n{stats['books_skipped']} book/audiobook item(s) skipped "
